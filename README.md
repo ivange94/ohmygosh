@@ -67,6 +67,15 @@ go> fmt.Println(id)
 
 ## Commands
 
+CLI commands:
+
+```text
+gosh --help       show CLI help
+gosh version      print the gosh version
+```
+
+REPL commands:
+
 ```text
 /help   show REPL help
 /exit   exit the prompt

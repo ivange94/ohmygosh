@@ -16,10 +16,13 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
 
 const prompt = "go> "
+
+var version = "dev"
 
 const sessionModule = `module ohmygosh-session
 
@@ -55,16 +58,39 @@ type statement struct {
 }
 
 func main() {
+	rootCmd := &cobra.Command{
+		Use:   "gosh",
+		Short: "Interactive Go prompt",
+		Long:  "ohmygosh is an interactive Go prompt for trying small snippets without setting up a scratch file.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runREPL()
+		},
+	}
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "version",
+		Short: "Print the gosh version",
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Fprintf(cmd.OutOrStdout(), "gosh %s\n", version)
+		},
+	})
+
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func runREPL() error {
 	dir, err := os.MkdirTemp("", "ohmygosh-*")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	defer os.RemoveAll(dir)
 
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(sessionModule), 0o600); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 
 	s := &session{dir: dir}
@@ -74,8 +100,7 @@ func main() {
 	for {
 		line, ok, err := reader.ReadLine(prompt)
 		if err != nil {
-			printError(err)
-			os.Exit(1)
+			return err
 		}
 		if !ok {
 			break
@@ -89,7 +114,7 @@ func main() {
 		cmd, ok := parseCommand(line)
 		if ok {
 			if runCommand(cmd) {
-				return
+				return nil
 			}
 			continue
 		}
@@ -98,6 +123,7 @@ func main() {
 			printError(err)
 		}
 	}
+	return nil
 }
 
 type lineReader interface {
