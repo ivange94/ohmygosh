@@ -21,6 +21,14 @@ const sessionModule = `module ohmygosh-session
 go 1.26.1
 `
 
+const (
+	colorReset  = "\x1b[0m"
+	colorRed    = "\x1b[31m"
+	colorGreen  = "\x1b[32m"
+	colorYellow = "\x1b[33m"
+	colorCyan   = "\x1b[36m"
+)
+
 type session struct {
 	dir        string
 	imports    []userImport
@@ -55,9 +63,9 @@ func main() {
 	s := &session{dir: dir}
 	scanner := bufio.NewScanner(os.Stdin)
 
-	fmt.Println("ohmygosh interactive Go prompt. Use /exit or Ctrl-D to exit.")
+	printIntro()
 	for {
-		fmt.Print(prompt)
+		printPrompt()
 		if !scanner.Scan() {
 			fmt.Println()
 			break
@@ -77,12 +85,12 @@ func main() {
 		}
 
 		if err := s.eval(line); err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			printError(err)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		printError(err)
 		os.Exit(1)
 	}
 }
@@ -107,12 +115,61 @@ func runCommand(cmd string) bool {
 	case "exit", "quit", "q":
 		return true
 	case "help", "?":
-		fmt.Println("Enter one Go statement per line. Top-level declarations are remembered; statements run as if inside main.")
-		fmt.Println("Program commands: /exit, /quit, /help.")
+		printHelp()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
+		printError(fmt.Errorf("unknown command: %s", cmd))
 	}
 	return false
+}
+
+func printIntro() {
+	fmt.Printf("%s interactive Go prompt. Use %s or Ctrl-D to exit.\n",
+		style("ohmygosh", colorGreen, os.Stdout),
+		style("/exit", colorYellow, os.Stdout),
+	)
+}
+
+func printPrompt() {
+	fmt.Print(style(prompt, colorCyan, os.Stdout))
+}
+
+func printHelp() {
+	fmt.Println("Enter one Go statement per line. Top-level var, const, and type declarations are remembered; statements run as if inside main.")
+	fmt.Printf("Program commands: %s, %s, %s.\n",
+		style("/exit", colorYellow, os.Stdout),
+		style("/quit", colorYellow, os.Stdout),
+		style("/help", colorYellow, os.Stdout),
+	)
+}
+
+func printError(err error) {
+	fmt.Fprintln(os.Stderr, style(err.Error(), colorRed, os.Stderr))
+}
+
+func printCommandStdout(text string) {
+	fmt.Print(style(text, colorGreen, os.Stdout))
+}
+
+func printCommandStderr(text string) {
+	fmt.Fprint(os.Stderr, style(text, colorRed, os.Stderr))
+}
+
+func style(text string, color string, file *os.File) string {
+	if !shouldColor(file) {
+		return text
+	}
+	return color + text + colorReset
+}
+
+func shouldColor(file *os.File) bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func (s *session) eval(line string) error {
@@ -123,6 +180,10 @@ func (s *session) eval(line string) error {
 	if imp, ok := parseImport(line); ok {
 		s.imports = append(s.imports, imp)
 		return nil
+	}
+
+	if parseFunctionDeclaration(line) {
+		return errors.New("function declarations are not supported yet")
 	}
 
 	if parseDeclaration(line) {
@@ -151,10 +212,10 @@ func (s *session) runStatement(stmt statement) error {
 
 	err := cmd.Run()
 	if stdout.Len() > 0 {
-		fmt.Print(stdout.String())
+		printCommandStdout(stdout.String())
 	}
 	if stderr.Len() > 0 {
-		fmt.Fprint(os.Stderr, stderr.String())
+		printCommandStderr(stderr.String())
 	}
 	if err != nil {
 		return fmt.Errorf("statement did not run: %w", err)
@@ -174,17 +235,16 @@ func (s *session) source(current statement) string {
 			b.WriteString("\n")
 		}
 	}
-	if len(s.imports) > 0 {
+	if len(s.statements) > 0 {
+		b.WriteString("import __gosh_io \"io\"\n")
+		b.WriteString("import __gosh_os \"os\"\n")
+	}
+	if len(s.imports) > 0 || len(s.statements) > 0 {
 		b.WriteByte('\n')
 	}
 	for _, decl := range s.decls {
 		b.WriteString(decl)
 		b.WriteString("\n\n")
-	}
-
-	if len(s.statements) > 0 {
-		b.WriteString("import __gosh_io \"io\"\n")
-		b.WriteString("import __gosh_os \"os\"\n\n")
 	}
 
 	b.WriteString("func main() {\n")
@@ -272,7 +332,35 @@ func parseImport(line string) (userImport, bool) {
 func parseDeclaration(line string) bool {
 	src := "package main\n" + line + "\n"
 	file, err := parser.ParseFile(token.NewFileSet(), "input.go", src, 0)
-	return err == nil && len(file.Decls) > 0
+	if err != nil || len(file.Decls) == 0 {
+		return false
+	}
+	for _, decl := range file.Decls {
+		genDecl, ok := decl.(*ast.GenDecl)
+		if !ok {
+			return false
+		}
+		switch genDecl.Tok {
+		case token.CONST, token.TYPE, token.VAR:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func parseFunctionDeclaration(line string) bool {
+	src := "package main\n" + line + "\n"
+	file, err := parser.ParseFile(token.NewFileSet(), "input.go", src, 0)
+	if err != nil {
+		return false
+	}
+	for _, decl := range file.Decls {
+		if _, ok := decl.(*ast.FuncDecl); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func promptDeclaredNames(stmts []ast.Stmt) []string {

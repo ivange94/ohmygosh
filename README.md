@@ -12,7 +12,7 @@ file.
 `ohmygosh` gives you a tiny Go REPL:
 
 - Run one Go statement at a time.
-- Keep top-level declarations between prompts.
+- Keep top-level `var`, `const`, and `type` declarations between prompts.
 - Keep imports and only include them when they are used.
 - Resolve third-party modules through the Go toolchain.
 - Preserve prior statements so later input can refer to earlier variables.
