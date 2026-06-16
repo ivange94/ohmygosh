@@ -14,6 +14,7 @@ file.
 - Run one Go statement at a time.
 - Keep top-level declarations between prompts.
 - Keep imports and only include them when they are used.
+- Resolve third-party modules through the Go toolchain.
 - Preserve prior statements so later input can refer to earlier variables.
 - Exit with `/exit` or Ctrl-D.
 
@@ -52,6 +53,15 @@ go> name := "Go"
 go> fmt.Println("hello", name)
 hello Go
 go> /exit
+```
+
+Third-party modules work the same way:
+
+```text
+go> import "fmt"
+go> import "github.com/google/uuid"
+go> id := uuid.NewString()
+go> fmt.Println(id)
 ```
 
 ## Commands

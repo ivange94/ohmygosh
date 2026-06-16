@@ -16,6 +16,11 @@ import (
 
 const prompt = "go> "
 
+const sessionModule = `module ohmygosh-session
+
+go 1.26.1
+`
+
 type session struct {
 	dir        string
 	imports    []userImport
@@ -25,7 +30,7 @@ type session struct {
 
 type userImport struct {
 	text   string
-	name   string
+	names  []string
 	always bool
 }
 
@@ -41,6 +46,11 @@ func main() {
 		os.Exit(1)
 	}
 	defer os.RemoveAll(dir)
+
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(sessionModule), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	s := &session{dir: dir}
 	scanner := bufio.NewScanner(os.Stdin)
@@ -130,7 +140,7 @@ func (s *session) runStatement(stmt statement) error {
 		return err
 	}
 
-	cmd := exec.Command("go", "run", mainFile)
+	cmd := exec.Command("go", "run", "-mod=mod", ".")
 	cmd.Dir = s.dir
 	cmd.Stdin = os.Stdin
 
@@ -159,7 +169,7 @@ func (s *session) source(current statement) string {
 	b.WriteString("package main\n\n")
 	body := s.bodyText(current.text)
 	for _, imp := range s.imports {
-		if imp.always || strings.Contains(body, imp.name+".") {
+		if imp.always || importUsed(body, imp.names) {
 			b.WriteString(imp.text)
 			b.WriteString("\n")
 		}
@@ -255,8 +265,8 @@ func parseImport(line string) (userImport, bool) {
 	}
 
 	spec := file.Imports[0]
-	name, always := importName(spec)
-	return userImport{text: line, name: name, always: always}, true
+	names, always := importNames(spec)
+	return userImport{text: line, names: names, always: always}, true
 }
 
 func parseDeclaration(line string) bool {
@@ -305,16 +315,80 @@ func promptDeclaredNames(stmts []ast.Stmt) []string {
 	}
 }
 
-func importName(spec *ast.ImportSpec) (string, bool) {
+func importUsed(body string, names []string) bool {
+	for _, name := range names {
+		if strings.Contains(body, name+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func importNames(spec *ast.ImportSpec) ([]string, bool) {
 	if spec.Name != nil {
 		if spec.Name.Name == "_" || spec.Name.Name == "." {
-			return spec.Name.Name, true
+			return []string{spec.Name.Name}, true
 		}
-		return spec.Name.Name, false
+		return []string{spec.Name.Name}, false
 	}
 
 	path := strings.Trim(spec.Path.Value, `"`)
-	base := path[strings.LastIndex(path, "/")+1:]
-	base = strings.ReplaceAll(base, "-", "_")
-	return base, false
+	parts := strings.Split(path, "/")
+	base := parts[len(parts)-1]
+
+	var names []string
+	addName := func(name string) {
+		name = strings.ReplaceAll(name, "-", "_")
+		if name == "" {
+			return
+		}
+		for _, existing := range names {
+			if existing == name {
+				return
+			}
+		}
+		names = append(names, name)
+	}
+
+	addName(base)
+	if versioned, ok := trimVersionSuffix(base); ok {
+		addName(versioned)
+	}
+	if isVersionComponent(base) && len(parts) > 1 {
+		previous := parts[len(parts)-2]
+		addName(previous)
+		if hyphen := strings.LastIndex(previous, "-"); hyphen >= 0 && hyphen < len(previous)-1 {
+			addName(previous[hyphen+1:])
+		}
+	}
+	if hyphen := strings.LastIndex(base, "-"); hyphen >= 0 && hyphen < len(base)-1 {
+		addName(base[hyphen+1:])
+	}
+
+	return names, false
+}
+
+func trimVersionSuffix(name string) (string, bool) {
+	dot := strings.LastIndex(name, ".v")
+	if dot < 0 || dot+2 >= len(name) {
+		return "", false
+	}
+	for _, r := range name[dot+2:] {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return name[:dot], true
+}
+
+func isVersionComponent(name string) bool {
+	if len(name) < 2 || name[0] != 'v' {
+		return false
+	}
+	for _, r := range name[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
