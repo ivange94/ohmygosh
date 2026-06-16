@@ -8,10 +8,15 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/term"
 )
 
 const prompt = "go> "
@@ -33,11 +38,13 @@ type session struct {
 	dir        string
 	imports    []userImport
 	decls      []string
+	names      []string
 	statements []statement
 }
 
 type userImport struct {
 	text   string
+	path   string
 	names  []string
 	always bool
 }
@@ -61,17 +68,20 @@ func main() {
 	}
 
 	s := &session{dir: dir}
-	scanner := bufio.NewScanner(os.Stdin)
+	reader := newLineReader(os.Stdin, os.Stdout, s)
 
 	printIntro()
 	for {
-		printPrompt()
-		if !scanner.Scan() {
-			fmt.Println()
+		line, ok, err := reader.ReadLine(prompt)
+		if err != nil {
+			printError(err)
+			os.Exit(1)
+		}
+		if !ok {
 			break
 		}
 
-		line := strings.TrimSpace(scanner.Text())
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
@@ -88,11 +98,261 @@ func main() {
 			printError(err)
 		}
 	}
+}
 
-	if err := scanner.Err(); err != nil {
-		printError(err)
-		os.Exit(1)
+type lineReader interface {
+	ReadLine(prompt string) (string, bool, error)
+}
+
+type scannerLineReader struct {
+	scanner *bufio.Scanner
+	out     io.Writer
+}
+
+func newLineReader(in *os.File, out *os.File, s *session) lineReader {
+	if isTerminal(in) && isTerminal(out) {
+		return &terminalLineReader{in: in, out: out, session: s}
 	}
+	return &scannerLineReader{scanner: bufio.NewScanner(in), out: out}
+}
+
+func (r *scannerLineReader) ReadLine(prompt string) (string, bool, error) {
+	fmt.Fprint(r.out, style(prompt, colorCyan, os.Stdout))
+	if !r.scanner.Scan() {
+		if err := r.scanner.Err(); err != nil {
+			return "", false, err
+		}
+		fmt.Fprintln(r.out)
+		return "", false, nil
+	}
+	return r.scanner.Text(), true, nil
+}
+
+type terminalLineReader struct {
+	in      *os.File
+	out     *os.File
+	session *session
+	history []string
+}
+
+func (r *terminalLineReader) ReadLine(prompt string) (string, bool, error) {
+	fd := int(r.in.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		return "", false, err
+	}
+	defer term.Restore(fd, oldState)
+
+	var line []rune
+	cursor := 0
+	historyIndex := len(r.history)
+	draft := ""
+
+	render := func() {
+		fmt.Fprintf(r.out, "\r\x1b[2K%s%s", style(prompt, colorCyan, os.Stdout), string(line))
+		if back := len(line) - cursor; back > 0 {
+			fmt.Fprintf(r.out, "\x1b[%dD", back)
+		}
+	}
+	render()
+
+	var buf [1]byte
+	for {
+		n, err := r.in.Read(buf[:])
+		if err != nil {
+			return "", false, err
+		}
+		if n == 0 {
+			continue
+		}
+
+		switch b := buf[0]; b {
+		case '\r', '\n':
+			text := string(line)
+			fmt.Fprint(r.out, "\r\n")
+			if strings.TrimSpace(text) != "" {
+				r.history = append(r.history, text)
+			}
+			return text, true, nil
+		case 3: // Ctrl-C clears the current input.
+			fmt.Fprint(r.out, "^C\r\n")
+			return "", true, nil
+		case 4: // Ctrl-D exits on an empty line.
+			if len(line) == 0 {
+				fmt.Fprint(r.out, "\r\n")
+				return "", false, nil
+			}
+		case 9: // Tab
+			line, cursor = r.complete(line, cursor)
+			render()
+		case 27:
+			line, cursor, historyIndex, draft = r.handleEscape(line, cursor, historyIndex, draft)
+			render()
+		case 127, 8:
+			if cursor > 0 {
+				line = append(line[:cursor-1], line[cursor:]...)
+				cursor--
+				render()
+			}
+		default:
+			if b < 32 {
+				continue
+			}
+			rr, err := r.readRune(b)
+			if err != nil {
+				return "", false, err
+			}
+			line = append(line[:cursor], append([]rune{rr}, line[cursor:]...)...)
+			cursor++
+			historyIndex = len(r.history)
+			render()
+		}
+	}
+}
+
+func (r *terminalLineReader) readRune(first byte) (rune, error) {
+	if first < utf8.RuneSelf {
+		return rune(first), nil
+	}
+
+	var buf [utf8.UTFMax]byte
+	buf[0] = first
+	size := 1
+	for size < utf8.UTFMax && !utf8.FullRune(buf[:size]) {
+		if _, err := r.in.Read(buf[size : size+1]); err != nil {
+			return utf8.RuneError, err
+		}
+		size++
+	}
+	rr, _ := utf8.DecodeRune(buf[:size])
+	return rr, nil
+}
+
+func (r *terminalLineReader) handleEscape(line []rune, cursor int, historyIndex int, draft string) ([]rune, int, int, string) {
+	var seq [2]byte
+	n, err := r.in.Read(seq[:])
+	if err != nil || n < 2 || seq[0] != '[' {
+		return line, cursor, historyIndex, draft
+	}
+
+	switch seq[1] {
+	case 'A': // Up
+		if len(r.history) == 0 || historyIndex == 0 {
+			return line, cursor, historyIndex, draft
+		}
+		if historyIndex == len(r.history) {
+			draft = string(line)
+		}
+		historyIndex--
+		line = []rune(r.history[historyIndex])
+		return line, len(line), historyIndex, draft
+	case 'B': // Down
+		if historyIndex >= len(r.history) {
+			return line, cursor, historyIndex, draft
+		}
+		historyIndex++
+		if historyIndex == len(r.history) {
+			line = []rune(draft)
+		} else {
+			line = []rune(r.history[historyIndex])
+		}
+		return line, len(line), historyIndex, draft
+	case 'C': // Right
+		if cursor < len(line) {
+			cursor++
+		}
+	case 'D': // Left
+		if cursor > 0 {
+			cursor--
+		}
+	case '1', '3', '4', '7', '8':
+		var discard [1]byte
+		_, _ = r.in.Read(discard[:])
+	}
+	return line, cursor, historyIndex, draft
+}
+
+func (r *terminalLineReader) complete(line []rune, cursor int) ([]rune, int) {
+	start := completionStart(line, cursor)
+	prefix := string(line[start:cursor])
+	if prefix == "" {
+		return line, cursor
+	}
+
+	var match string
+	var ok bool
+	if qualifier, qualifierOK := completionQualifier(line, start); qualifierOK {
+		match, ok = completion(prefix, r.session.packageCompletions(qualifier))
+	} else {
+		match, ok = completion(prefix, r.session.completions())
+	}
+	if !ok || match == prefix {
+		return line, cursor
+	}
+
+	replacement := []rune(match)
+	line = append(line[:start], append(replacement, line[cursor:]...)...)
+	return line, start + len(replacement)
+}
+
+func completionStart(line []rune, cursor int) int {
+	start := cursor
+	for start > 0 {
+		r := line[start-1]
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '/') {
+			break
+		}
+		start--
+	}
+	return start
+}
+
+func completionQualifier(line []rune, start int) (string, bool) {
+	if start < 2 || line[start-1] != '.' {
+		return "", false
+	}
+	end := start - 1
+	begin := end
+	for begin > 0 {
+		r := line[begin-1]
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+			break
+		}
+		begin--
+	}
+	if begin == end {
+		return "", false
+	}
+	return string(line[begin:end]), true
+}
+
+func completion(prefix string, options []string) (string, bool) {
+	var matches []string
+	for _, option := range options {
+		if strings.HasPrefix(option, prefix) {
+			matches = append(matches, option)
+		}
+	}
+	if len(matches) == 0 {
+		return "", false
+	}
+	if len(matches) == 1 {
+		return matches[0], true
+	}
+	return longestCommonPrefix(matches), true
+}
+
+func longestCommonPrefix(values []string) string {
+	prefix := values[0]
+	for _, value := range values[1:] {
+		for !strings.HasPrefix(value, prefix) {
+			if prefix == "" {
+				return ""
+			}
+			prefix = prefix[:len(prefix)-1]
+		}
+	}
+	return prefix
 }
 
 func parseCommand(line string) (string, bool) {
@@ -135,6 +395,7 @@ func printPrompt() {
 
 func printHelp() {
 	fmt.Println("Enter one Go statement per line. Top-level var, const, and type declarations are remembered; statements run as if inside main.")
+	fmt.Println("Use Up/Down for history and Tab for autocomplete.")
 	fmt.Printf("Program commands: %s, %s, %s.\n",
 		style("/exit", colorYellow, os.Stdout),
 		style("/quit", colorYellow, os.Stdout),
@@ -165,11 +426,11 @@ func shouldColor(file *os.File) bool {
 	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
 		return false
 	}
-	info, err := file.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return isTerminal(file)
+}
+
+func isTerminal(file *os.File) bool {
+	return term.IsTerminal(int(file.Fd()))
 }
 
 func (s *session) eval(line string) error {
@@ -179,6 +440,7 @@ func (s *session) eval(line string) error {
 
 	if imp, ok := parseImport(line); ok {
 		s.imports = append(s.imports, imp)
+		s.addNames(imp.names...)
 		return nil
 	}
 
@@ -188,6 +450,7 @@ func (s *session) eval(line string) error {
 
 	if parseDeclaration(line) {
 		s.decls = append(s.decls, line)
+		s.addNames(declaredNames(line)...)
 		return nil
 	}
 
@@ -222,7 +485,112 @@ func (s *session) runStatement(stmt statement) error {
 	}
 
 	s.statements = append(s.statements, stmt)
+	s.addNames(stmt.declared...)
 	return nil
+}
+
+func (s *session) addNames(names ...string) {
+	for _, name := range names {
+		if name == "" || name == "_" || name == "." {
+			continue
+		}
+		exists := false
+		for _, existing := range s.names {
+			if existing == name {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			s.names = append(s.names, name)
+		}
+	}
+}
+
+func (s *session) completions() []string {
+	options := []string{
+		"/exit", "/quit", "/q", "/help",
+		"break", "case", "chan", "const", "continue", "default", "defer",
+		"else", "fallthrough", "for", "go", "goto", "if", "import",
+		"interface", "map", "package", "range", "return", "select",
+		"struct", "switch", "type", "var",
+		"append", "bool", "byte", "cap", "close", "complex", "complex64",
+		"complex128", "copy", "delete", "error", "false", "float32",
+		"float64", "imag", "int", "int8", "int16", "int32", "int64",
+		"iota", "len", "make", "new", "nil", "panic", "print", "println",
+		"real", "recover", "rune", "string", "true", "uint", "uint8",
+		"uint16", "uint32", "uint64", "uintptr",
+	}
+	options = append(options, s.names...)
+	return uniqueStrings(options)
+}
+
+func (s *session) packageCompletions(qualifier string) []string {
+	path := ""
+	for _, imp := range s.imports {
+		for _, name := range imp.names {
+			if name == qualifier {
+				path = imp.path
+				break
+			}
+		}
+		if path != "" {
+			break
+		}
+	}
+	if path == "" {
+		return nil
+	}
+	return docSymbols(s.dir, path)
+}
+
+func docSymbols(dir string, path string) []string {
+	cmd := exec.Command("go", "doc", "-short", path)
+	cmd.Dir = dir
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return nil
+	}
+
+	var symbols []string
+	scanner := bufio.NewScanner(&stdout)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[0] {
+		case "func", "type", "var", "const":
+			name := symbolName(fields[1])
+			if ast.IsExported(name) {
+				symbols = append(symbols, name)
+			}
+		}
+	}
+	return uniqueStrings(symbols)
+}
+
+func symbolName(text string) string {
+	for i, r := range text {
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_') {
+			return text[:i]
+		}
+	}
+	return text
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	var unique []string
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		unique = append(unique, value)
+	}
+	return unique
 }
 
 func (s *session) source(current statement) string {
@@ -326,7 +694,7 @@ func parseImport(line string) (userImport, bool) {
 
 	spec := file.Imports[0]
 	names, always := importNames(spec)
-	return userImport{text: line, names: names, always: always}, true
+	return userImport{text: line, path: importPath(spec), names: names, always: always}, true
 }
 
 func parseDeclaration(line string) bool {
@@ -347,6 +715,33 @@ func parseDeclaration(line string) bool {
 		}
 	}
 	return true
+}
+
+func declaredNames(line string) []string {
+	src := "package main\n" + line + "\n"
+	file, err := parser.ParseFile(token.NewFileSet(), "input.go", src, 0)
+	if err != nil {
+		return nil
+	}
+
+	var names []string
+	for _, decl := range file.Decls {
+		genDecl, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range genDecl.Specs {
+			switch spec := spec.(type) {
+			case *ast.ValueSpec:
+				for _, name := range spec.Names {
+					names = append(names, name.Name)
+				}
+			case *ast.TypeSpec:
+				names = append(names, spec.Name.Name)
+			}
+		}
+	}
+	return names
 }
 
 func parseFunctionDeclaration(line string) bool {
@@ -454,6 +849,10 @@ func importNames(spec *ast.ImportSpec) ([]string, bool) {
 	}
 
 	return names, false
+}
+
+func importPath(spec *ast.ImportSpec) string {
+	return strings.Trim(spec.Path.Value, `"`)
 }
 
 func trimVersionSuffix(name string) (string, bool) {

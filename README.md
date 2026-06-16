@@ -16,6 +16,7 @@ file.
 - Keep imports and only include them when they are used.
 - Resolve third-party modules through the Go toolchain.
 - Preserve prior statements so later input can refer to earlier variables.
+- Use arrow keys for command history and Tab for autocomplete.
 - Exit with `/exit` or Ctrl-D.
 
 ## Install
@@ -72,6 +73,10 @@ go> fmt.Println(id)
 /quit   exit the prompt
 /q      exit the prompt
 ```
+
+Interactive prompts support Up/Down history and Tab completion for commands,
+Go keywords, remembered names, imported package names, and exported package
+symbols such as `fmt.Println`.
 
 ## Notes
 
