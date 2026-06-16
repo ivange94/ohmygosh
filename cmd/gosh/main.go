@@ -45,7 +45,7 @@ func main() {
 	s := &session{dir: dir}
 	scanner := bufio.NewScanner(os.Stdin)
 
-	fmt.Println("ohmygosh interactive Go prompt. Use :quit or Ctrl-D to exit.")
+	fmt.Println("ohmygosh interactive Go prompt. Use /exit or Ctrl-D to exit.")
 	for {
 		fmt.Print(prompt)
 		if !scanner.Scan() {
@@ -54,13 +54,15 @@ func main() {
 		}
 
 		line := strings.TrimSpace(scanner.Text())
-		switch line {
-		case "":
+		if line == "" {
 			continue
-		case ":quit", ":exit":
-			return
-		case ":help":
-			fmt.Println("Enter one Go statement per line. Top-level declarations are remembered; statements run as if inside main.")
+		}
+
+		cmd, ok := parseCommand(line)
+		if ok {
+			if runCommand(cmd) {
+				return
+			}
 			continue
 		}
 
@@ -73,6 +75,34 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func parseCommand(line string) (string, bool) {
+	if strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") {
+		return "", false
+	}
+
+	if len(line) < 2 {
+		return "", false
+	}
+
+	if line[0] == '/' {
+		return strings.TrimSpace(line[1:]), true
+	}
+	return "", false
+}
+
+func runCommand(cmd string) bool {
+	switch cmd {
+	case "exit", "quit", "q":
+		return true
+	case "help", "?":
+		fmt.Println("Enter one Go statement per line. Top-level declarations are remembered; statements run as if inside main.")
+		fmt.Println("Program commands: /exit, /quit, /help.")
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
+	}
+	return false
 }
 
 func (s *session) eval(line string) error {

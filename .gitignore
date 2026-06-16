@@ -1,0 +1,24 @@
+# Binaries
+/gosh
+/goplay
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go build and test output
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Local environment
+.env
+.env.*
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
